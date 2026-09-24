@@ -1,0 +1,36 @@
+name: oaslananka-agent runtime
+description: Execute a canonical oaslananka-agent task in an isolated Git worktree.
+author: oaslananka
+
+inputs:
+  task_json:
+    description: Canonical AgentTask JSON.
+    required: true
+  engine:
+    description: Optional explicit engine ID. Empty means routing/default selection.
+    required: false
+    default: ""
+
+outputs:
+  result_file:
+    description: Absolute path to the structured runtime result JSON.
+  timeline_file:
+    description: Absolute path to the structured execution timeline JSONL.
+  artifact_directory:
+    description: Absolute path to generated engine artifacts.
+  status:
+    description: Agent execution status.
+  engine:
+    description: Engine that executed the task.
+  workspace_dirty:
+    description: Whether the isolated worktree changed.
+  publish_file:
+    description: Absolute path to a validated repo-write publish request, when present.
+  permission_profile:
+    description: Original task permission profile.
+  operation:
+    description: Original task operation.
+
+runs:
+  using: node24
+  main: dist/index.mjs

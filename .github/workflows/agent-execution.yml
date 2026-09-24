@@ -1,0 +1,615 @@
+name: Agent Execution
+
+on:
+  repository_dispatch:
+    types: [oaslananka-agent-task]
+  workflow_call:
+    inputs:
+      task_json:
+        description: Canonical AgentTask JSON.
+        required: true
+        type: string
+      task_id:
+        description: Canonical task ID, used only for workflow concurrency deduplication.
+        required: false
+        type: string
+        default: ""
+      engine:
+        description: Optional explicit engine ID.
+        required: false
+        type: string
+        default: ""
+      codex_model:
+        description: Optional Codex model override.
+        required: false
+        type: string
+        default: ""
+      claude_model:
+        description: Optional Claude model override.
+        required: false
+        type: string
+        default: ""
+      claude_effort:
+        description: Optional Claude effort override.
+        required: false
+        type: string
+        default: ""
+      opencode_model:
+        description: Optional OpenCode model override.
+        required: false
+        type: string
+        default: ""
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+      CODEX_AUTH_JSON:
+        required: false
+      OPENAI_API_KEY:
+        required: false
+      OPENCODE_API_KEY:
+        required: false
+      SECOND_BRAIN_MCP_TOKEN:
+        required: false
+      JULES_API_KEY:
+        required: false
+  workflow_dispatch:
+    inputs:
+      task_json:
+        description: Canonical AgentTask JSON.
+        required: true
+        type: string
+      task_id:
+        description: Canonical task ID, used only for workflow concurrency deduplication.
+        required: false
+        type: string
+        default: ""
+      engine:
+        description: Optional explicit engine ID.
+        required: false
+        type: string
+        default: ""
+      codex_model:
+        description: Optional Codex model override.
+        required: false
+        type: string
+        default: ""
+      claude_model:
+        description: Optional Claude model override.
+        required: false
+        type: string
+        default: ""
+      claude_effort:
+        description: Optional Claude effort override.
+        required: false
+        type: string
+        default: ""
+      opencode_model:
+        description: Optional OpenCode model override.
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: oaslananka-agent-${{ github.repository }}-${{ inputs.task_id || github.event.client_payload.task.id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  execute:
+    name: Execute canonical task
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    outputs:
+      publish_ready: ${{ steps.agent.outputs.publish_file != '' }}
+    env:
+      AGENT_CODEX_MODEL: ${{ inputs.codex_model || github.event.client_payload.codex_model || vars.OASLANANKA_AGENT_CODEX_MODEL || '' }}
+      AGENT_CLAUDE_MODEL: ${{ inputs.claude_model || github.event.client_payload.claude_model || vars.OASLANANKA_AGENT_CLAUDE_MODEL || '' }}
+      AGENT_CLAUDE_EFFORT: ${{ inputs.claude_effort || github.event.client_payload.claude_effort || vars.OASLANANKA_AGENT_CLAUDE_EFFORT || '' }}
+      AGENT_OPENCODE_MODEL: ${{ inputs.opencode_model || github.event.client_payload.opencode_model || vars.OASLANANKA_AGENT_OPENCODE_MODEL || '' }}
+
+    steps:
+      - name: Resolve execution policy
+        id: routing
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          TASK_JSON: ${{ inputs.task_json || toJSON(github.event.client_payload.task) }}
+          ENGINE_INPUT: ${{ inputs.engine || github.event.client_payload.engine || '' }}
+        with:
+          result-encoding: string
+          script: |
+            const task = JSON.parse(process.env.TASK_JSON)
+            const selected =
+              process.env.ENGINE_INPUT ||
+              (task.engine?.strategy === 'fixed' ? task.engine.preferred : '') ||
+              'jules'
+            const executionContext = task.execution?.context || 'repository'
+            if (!['mock', 'codex', 'claude', 'jules', 'opencode'].includes(selected)) {
+              core.setFailed('Unsupported engine: ' + selected)
+              return ''
+            }
+            if (!['repository', 'repoless'].includes(executionContext)) {
+              core.setFailed('Unsupported execution context: ' + executionContext)
+              return ''
+            }
+            core.setOutput('execution_context', executionContext)
+            return selected
+
+      - name: Checkout target repository
+        if: ${{ steps.routing.outputs.execution_context != 'repoless' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js for CLI engine
+        if: ${{ steps.routing.outputs.result == 'claude' || steps.routing.outputs.result == 'codex' || steps.routing.outputs.result == 'opencode' }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Install Claude engine runtime
+        if: ${{ steps.routing.outputs.result == 'claude' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global --ignore-scripts @anthropic-ai/claude-code@2.1.280
+
+          claude_root="$(npm root --global)/@anthropic-ai/claude-code"
+          install_script="$claude_root/install.cjs"
+          expected_sha256="5cbab1670597f492cd4eeb946f3c344ebcb1fbd43c623ba192c9b33744461b85"
+
+          echo "$expected_sha256  $install_script" | sha256sum --check -
+          node "$install_script"
+
+          installed_version="$(claude --version)"
+          case "$installed_version" in
+            *"2.1.280"*) ;;
+            *)
+              echo "Unexpected Claude Code version: $installed_version" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Verify Claude subscription authentication
+        if: ${{ steps.routing.outputs.result == 'claude' }}
+        shell: bash
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+            echo "CLAUDE_CODE_OAUTH_TOKEN is required for Claude subscription execution." >&2
+            exit 1
+          fi
+
+      - name: Install Codex engine runtime
+        if: ${{ steps.routing.outputs.result == 'codex' }}
+        shell: bash
+        run: |
+          npm install --global \
+            @openai/codex@0.156.0 \
+            @openai/codex-responses-api-proxy@0.156.0
+
+      - name: Prepare Codex Linux sandbox
+        if: ${{ steps.routing.outputs.result == 'codex' && runner.os == 'Linux' && runner.environment == 'github-hosted' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v bwrap >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends bubblewrap
+          fi
+
+          current_userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"
+          if [ -n "$current_userns" ] && [ "$current_userns" != "1" ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+
+          current_apparmor="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"
+          if [ -n "$current_apparmor" ] && [ "$current_apparmor" != "0" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - name: Install OpenCode engine runtime
+        if: ${{ steps.routing.outputs.result == 'opencode' }}
+        shell: bash
+        run: |
+          npm install --global @opencode/cli@2.0.14
+
+      - name: Resolve Codex authentication
+        id: codex_auth
+        if: ${{ steps.routing.outputs.result == 'codex' }}
+        shell: bash
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "$CODEX_AUTH_JSON" ]; then
+            echo "mode=chatgpt" >> "$GITHUB_OUTPUT"
+          elif [ -n "$OPENAI_API_KEY" ]; then
+            echo "mode=api" >> "$GITHUB_OUTPUT"
+          else
+            echo "Codex requires CODEX_AUTH_JSON or OPENAI_API_KEY." >&2
+            exit 1
+          fi
+
+      - name: Start Responses API credential proxy
+        if: ${{ steps.routing.outputs.result == 'codex' && steps.codex_auth.outputs.mode == 'api' }}
+        shell: bash
+        env:
+          PROXY_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PROXY_API_KEY" ]; then
+            echo "OPENAI_API_KEY is required for the selected real engine." >&2
+            exit 1
+          fi
+
+          server_info="$RUNNER_TEMP/oaslananka-responses-proxy.json"
+          rm -f "$server_info"
+          args=(
+            codex-responses-api-proxy
+            --http-shutdown
+            --server-info "$server_info"
+          )
+
+          (
+            exec env -u PROXY_API_KEY -u OPENAI_API_KEY -u GITHUB_TOKEN \
+              -u NODE_OPTIONS NODE_OPTIONS=--disable-sigusr1 \
+              "${args[@]}" <<< "$PROXY_API_KEY"
+          ) &
+
+          for _ in {1..20}; do
+            [ -s "$server_info" ] && break
+            sleep 0.5
+          done
+          if [ ! -s "$server_info" ]; then
+            echo "Responses API proxy did not become ready." >&2
+            exit 1
+          fi
+
+          port="$(node -e 'const fs=require("node:fs"); const v=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.stdout.write(String(v.port))' "$server_info")"
+          echo "AGENT_OPENAI_PROXY_BASE_URL=http://127.0.0.1:$port" >> "$GITHUB_ENV"
+
+      - name: Execute agent runtime
+        id: agent
+        uses: $/.github/actions/agent-runtime
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ steps.routing.outputs.result == 'claude' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+          CODEX_AUTH_JSON: ${{ steps.routing.outputs.result == 'codex' && steps.codex_auth.outputs.mode == 'chatgpt' && secrets.CODEX_AUTH_JSON || '' }}
+          OPENCODE_API_KEY: ${{ steps.routing.outputs.result == 'opencode' && secrets.OPENCODE_API_KEY || '' }}
+          SECOND_BRAIN_MCP_TOKEN: ${{ secrets.SECOND_BRAIN_MCP_TOKEN }}
+          SECOND_BRAIN_MCP_URL: ${{ vars.SECOND_BRAIN_MCP_URL || 'https://secondbrain.oaslananka.dev/mcp' }}
+          JULES_API_KEY: ${{ steps.routing.outputs.result == 'jules' && secrets.JULES_API_KEY || '' }}
+          JULES_DAILY_TASK_LIMIT: ${{ vars.OASLANANKA_AGENT_JULES_DAILY_TASK_LIMIT || '100' }}
+          JULES_CONCURRENT_TASK_LIMIT: ${{ vars.OASLANANKA_AGENT_JULES_CONCURRENT_TASK_LIMIT || '15' }}
+        with:
+          task_json: ${{ inputs.task_json || toJSON(github.event.client_payload.task) }}
+          engine: ${{ steps.routing.outputs.result }}
+
+      - name: Upload execution observability
+        if: ${{ always() && steps.agent.outputs.result_file != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: oaslananka-agent-observability-${{ github.run_id }}
+          path: |
+            ${{ steps.agent.outputs.result_file }}
+            ${{ steps.agent.outputs.timeline_file }}
+            ${{ steps.agent.outputs.artifact_directory }}
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 6
+
+      - name: Upload validated publish request
+        if: ${{ steps.agent.outputs.publish_file != '' && steps.agent.outputs.status == 'succeeded' && steps.agent.outputs.permission_profile == 'repo-write' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: oaslananka-agent-publish
+          path: ${{ steps.agent.outputs.publish_file }}
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Stop Responses API credential proxy
+        if: ${{ always() && env.AGENT_OPENAI_PROXY_BASE_URL != '' }}
+        shell: bash
+        run: |
+          curl --fail --silent --show-error \
+            "$AGENT_OPENAI_PROXY_BASE_URL/shutdown" >/dev/null || true
+
+      - name: Publish result
+        if: ${{ always() && steps.agent.outputs.result_file != '' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          RESULT_FILE: ${{ steps.agent.outputs.result_file }}
+        with:
+          script: |
+            const fs = require('node:fs')
+            const payload = JSON.parse(fs.readFileSync(process.env.RESULT_FILE, 'utf8'))
+            const source = payload.task.source
+
+            if (!['issue', 'pull_request'].includes(source.type)) {
+              core.info('Task source does not have an issue conversation; result was not posted.')
+              return
+            }
+
+            const execution = payload.execution
+            const details = [
+              '- Engine: `' + execution.result.engine + '`',
+              '- Status: `' + execution.result.status + '`',
+              '- Permission profile: `' + payload.task.permissions.profile + '`',
+              '- Execution context: `' + (payload.task.execution?.context || 'repository') + '`',
+              '- Quality: `' + (payload.task.execution?.quality || 'adaptive') + '`',
+              '- Workspace changed: `' + execution.changes.dirty + '`',
+            ]
+            if (typeof execution.result.metadata?.sessionUrl === 'string') {
+              details.push('- Jules session: ' + execution.result.metadata.sessionUrl)
+            }
+            if (typeof execution.result.metadata?.providerState === 'string') {
+              details.push('- Provider state: `' + execution.result.metadata.providerState + '`')
+            }
+            const body = [
+              '### oaslananka-agent',
+              '',
+              'Task completed on GitHub Actions.',
+              '',
+              ...details,
+              '',
+              execution.result.summary,
+              '',
+              'Task ID: `' + payload.task.id + '`',
+            ].join('\n')
+
+            await github.rest.issues.createComment({
+              owner: payload.task.repository.owner,
+              repo: payload.task.repository.name,
+              issue_number: source.number,
+              body,
+            })
+
+      - name: Fail workflow on agent failure
+        if: ${{ always() && steps.agent.outputs.status == 'failed' }}
+        shell: bash
+        run: |
+          echo "Agent execution returned status=failed." >&2
+          exit 1
+
+  publish:
+    name: Publish repo-write changes
+    needs: execute
+    if: ${{ needs.execute.outputs.publish_ready == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Download validated publish request
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: oaslananka-agent-publish
+          path: ${{ runner.temp }}/oaslananka-agent-publish
+          digest-mismatch: error
+
+      - name: Authorize and publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_URL: https://agent.oaslananka.dev/github/publish
+          PUBLISH_AUDIENCE: oaslananka-agent-control-plane
+          PUBLISH_DIRECTORY: ${{ runner.temp }}/oaslananka-agent-publish
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { readFile, readdir } from "node:fs/promises";
+          import { join } from "node:path";
+
+          function required(name) {
+            const value = process.env[name]?.trim();
+            if (!value) {
+              throw new Error("Missing required environment variable: " + name);
+            }
+            return value;
+          }
+
+          const directory = required("PUBLISH_DIRECTORY");
+          const entries = await readdir(directory, { withFileTypes: true });
+          const files = entries.filter((entry) => entry.isFile());
+          if (files.length !== 1 || files[0].name !== "publish.json") {
+            throw new Error("Expected exactly one publish.json artifact.");
+          }
+
+          const publishBody = await readFile(join(directory, "publish.json"), "utf8");
+          const publishRequest = JSON.parse(publishBody);
+          const repository = required("GITHUB_REPOSITORY");
+          const [owner, repo] = repository.split("/");
+          if (!owner || !repo) {
+            throw new Error("Invalid GITHUB_REPOSITORY.");
+          }
+          const requestedRepository =
+            publishRequest?.task?.repository?.owner +
+            "/" +
+            publishRequest?.task?.repository?.name;
+          if (requestedRepository.toLowerCase() !== repository.toLowerCase()) {
+            throw new Error("Publish artifact repository mismatch.");
+          }
+
+          const oidcUrl = required("ACTIONS_ID_TOKEN_REQUEST_URL");
+          const separator = oidcUrl.includes("?") ? "&" : "?";
+          const tokenResponse = await fetch(
+            oidcUrl +
+              separator +
+              "audience=" +
+              encodeURIComponent(required("PUBLISH_AUDIENCE")),
+            {
+              headers: {
+                authorization:
+                  "bearer " + required("ACTIONS_ID_TOKEN_REQUEST_TOKEN"),
+              },
+            },
+          );
+          if (!tokenResponse.ok) {
+            throw new Error(
+              "GitHub OIDC token request failed: HTTP " + tokenResponse.status,
+            );
+          }
+          const tokenPayload = await tokenResponse.json();
+          if (typeof tokenPayload.value !== "string" || !tokenPayload.value) {
+            throw new Error("GitHub OIDC response did not contain a token.");
+          }
+
+          const authorizeResponse = await fetch(required("PUBLISH_URL"), {
+            method: "POST",
+            headers: {
+              authorization: "Bearer " + tokenPayload.value,
+              "content-type": "application/json",
+            },
+            body: publishBody,
+          });
+          const authorizeText = await authorizeResponse.text();
+          if (!authorizeResponse.ok) {
+            throw new Error(
+              "Control-plane publish authorization failed: HTTP " +
+                authorizeResponse.status +
+                (authorizeText ? " " + authorizeText.slice(0, 1_000) : ""),
+            );
+          }
+
+          const prepared = JSON.parse(authorizeText);
+          if (
+            prepared.ok !== true ||
+            typeof prepared.branch !== "string" ||
+            !/^agent\/fix-[1-9][0-9]*-[0-9a-f]{12}$/.test(prepared.branch) ||
+            typeof prepared.commitSha !== "string" ||
+            !/^[0-9a-f]{40}$/i.test(prepared.commitSha) ||
+            prepared.baseBranch !== publishRequest.baseBranch ||
+            typeof prepared.title !== "string" ||
+            typeof prepared.body !== "string" ||
+            prepared.issueNumber !== publishRequest.task.source.number
+          ) {
+            throw new Error("Control-plane publish plan was invalid.");
+          }
+
+          const apiBase = "https://api.github.com/repos/" + owner + "/" + repo;
+          const githubToken = required("GH_TOKEN");
+          async function github(path, options = {}) {
+            const response = await fetch(apiBase + path, {
+              method: options.method ?? "GET",
+              headers: {
+                accept: "application/vnd.github+json",
+                authorization: "Bearer " + githubToken,
+                "content-type": "application/json",
+                "x-github-api-version": "2026-03-10",
+              },
+              body:
+                options.body === undefined
+                  ? undefined
+                  : JSON.stringify(options.body),
+            });
+            if (options.allow404 && response.status === 404) {
+              return undefined;
+            }
+            const responseText = await response.text();
+            if (!response.ok) {
+              throw new Error(
+                "GitHub API failed: " +
+                  (options.method ?? "GET") +
+                  " " +
+                  path +
+                  " HTTP " +
+                  response.status +
+                  (responseText ? " " + responseText.slice(0, 1_000) : ""),
+              );
+            }
+            return responseText ? JSON.parse(responseText) : {};
+          }
+
+          const encodeRef = (ref) =>
+            ref.split("/").map(encodeURIComponent).join("/");
+          const baseRef = await github(
+            "/git/ref/" + encodeRef("heads/" + prepared.baseBranch),
+          );
+          if (baseRef.object?.sha !== publishRequest.baseSha) {
+            throw new Error("Base branch moved after publish authorization.");
+          }
+
+          const existingRef = await github(
+            "/git/ref/" + encodeRef("heads/" + prepared.branch),
+            { allow404: true },
+          );
+          if (existingRef) {
+            if (existingRef.object?.sha !== prepared.commitSha) {
+              throw new Error("Publish branch exists at an unexpected commit.");
+            }
+          } else {
+            await github("/git/refs", {
+              method: "POST",
+              body: {
+                ref: "refs/heads/" + prepared.branch,
+                sha: prepared.commitSha,
+              },
+            });
+          }
+
+          const query = new URLSearchParams({
+            state: "open",
+            head: owner + ":" + prepared.branch,
+            base: prepared.baseBranch,
+            per_page: "5",
+          });
+          const existingPulls = await github("/pulls?" + query.toString());
+          let pullRequest = existingPulls[0];
+          if (!pullRequest) {
+            pullRequest = await github("/pulls", {
+              method: "POST",
+              body: {
+                head: prepared.branch,
+                base: prepared.baseBranch,
+                title: prepared.title,
+                body: prepared.body,
+                draft: true,
+                maintainer_can_modify: false,
+              },
+            });
+          }
+
+          try {
+            await github("/issues/" + prepared.issueNumber + "/comments", {
+              method: "POST",
+              body: {
+                body: [
+                  "### oaslananka-agent",
+                  "",
+                  "Published changes as draft PR #" + pullRequest.number + ".",
+                  "",
+                  "Branch: `" + prepared.branch + "`",
+                  "Task ID: `" + publishRequest.task.id + "`",
+                ].join(String.fromCharCode(10)),
+              },
+            });
+          } catch (error) {
+            console.warn("Unable to comment on source issue:", error.message);
+          }
+
+          console.log(
+            "Published draft PR #" +
+              pullRequest.number +
+              " from branch " +
+              prepared.branch +
+              (prepared.existingBranch ? " (existing branch)" : ""),
+          );
+          NODE
