@@ -344,11 +344,15 @@ jobs:
             }
 
             const execution = payload.execution
+            const providerContext =
+              typeof execution.result.metadata?.executionContext === 'string'
+                ? execution.result.metadata.executionContext
+                : (payload.task.execution?.context || 'repository')
             const details = [
               '- Engine: `' + execution.result.engine + '`',
               '- Status: `' + execution.result.status + '`',
               '- Permission profile: `' + payload.task.permissions.profile + '`',
-              '- Execution context: `' + (payload.task.execution?.context || 'repository') + '`',
+              '- Execution context: `' + providerContext + '`',
               '- Quality: `' + (payload.task.execution?.quality || 'adaptive') + '`',
               '- Workspace changed: `' + execution.changes.dirty + '`',
             ]
