@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "sourceRepository": "oaslananka/oaslananka-agent",
-  "sourceCommit": "101ce5e10843308ddb5c0de86fececee88d924c5",
+  "sourceCommit": "a451d37265109ba7b0711b0415d5079f0cdc36e9",
   "files": [
     {
       "path": ".github/workflows/agent-execution.yml",
@@ -13,7 +13,7 @@
     },
     {
       "path": ".github/actions/agent-runtime/dist/index.mjs",
-      "sha256": "e75150ea3d60b65119968f9d3fc4c5895e6e1efa7d5118644fb2e1d9f5a4ad83"
+      "sha256": "3be4cb1953e2f5c4c3ed7149b5b1ad09392dd91a23a78454ad881d7244beeb4e"
     }
   ]
 }
